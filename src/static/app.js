@@ -3,6 +3,84 @@ document.addEventListener("DOMContentLoaded", () => {
   const activitySelect = document.getElementById("activity");
   const signupForm = document.getElementById("signup-form");
   const messageDiv = document.getElementById("message");
+  const loginForm = document.getElementById("login-form");
+  const authInfo = document.getElementById("auth-info");
+  const currentUserLabel = document.getElementById("current-user");
+  const logoutButton = document.getElementById("logout-btn");
+  const emailInput = document.getElementById("email");
+
+  const authState = {
+    token: localStorage.getItem("auth_token") || null,
+    user: null,
+  };
+
+  function authHeaders() {
+    if (!authState.token) {
+      return {};
+    }
+
+    return {
+      Authorization: `Bearer ${authState.token}`,
+    };
+  }
+
+  function canManageParticipants() {
+    return ["teacher", "admin", "leader"].includes(authState.user?.role);
+  }
+
+  function updateAuthUI() {
+    if (authState.user) {
+      loginForm.classList.add("hidden");
+      authInfo.classList.remove("hidden");
+      currentUserLabel.textContent = `${authState.user.username} (${authState.user.role})`;
+
+      signupForm.querySelector("button[type='submit']").disabled = false;
+      activitySelect.disabled = false;
+      emailInput.disabled = false;
+
+      if (authState.user.role === "student") {
+        emailInput.value = authState.user.email;
+        emailInput.disabled = true;
+      }
+    } else {
+      loginForm.classList.remove("hidden");
+      authInfo.classList.add("hidden");
+      currentUserLabel.textContent = "";
+      signupForm.querySelector("button[type='submit']").disabled = true;
+      activitySelect.disabled = true;
+      emailInput.disabled = true;
+      emailInput.value = "";
+    }
+  }
+
+  async function loadCurrentUser() {
+    if (!authState.token) {
+      authState.user = null;
+      updateAuthUI();
+      return;
+    }
+
+    try {
+      const response = await fetch("/auth/me", {
+        headers: {
+          ...authHeaders(),
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error("Session expired");
+      }
+
+      const result = await response.json();
+      authState.user = result.user;
+      updateAuthUI();
+    } catch (error) {
+      authState.token = null;
+      authState.user = null;
+      localStorage.removeItem("auth_token");
+      updateAuthUI();
+    }
+  }
 
   // Function to fetch activities from API
   async function fetchActivities() {
@@ -30,7 +108,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 ${details.participants
                   .map(
                     (email) =>
-                      `<li><span class="participant-email">${email}</span><button class="delete-btn" data-activity="${name}" data-email="${email}">❌</button></li>`
+                      `<li><span class="participant-email">${email}</span>${
+                        canManageParticipants()
+                          ? `<button class="delete-btn" data-activity="${name}" data-email="${email}">❌</button>`
+                          : ""
+                      }</li>`
                   )
                   .join("")}
               </ul>
@@ -57,9 +139,11 @@ document.addEventListener("DOMContentLoaded", () => {
       });
 
       // Add event listeners to delete buttons
-      document.querySelectorAll(".delete-btn").forEach((button) => {
-        button.addEventListener("click", handleUnregister);
-      });
+      if (canManageParticipants()) {
+        document.querySelectorAll(".delete-btn").forEach((button) => {
+          button.addEventListener("click", handleUnregister);
+        });
+      }
     } catch (error) {
       activitiesList.innerHTML =
         "<p>Failed to load activities. Please try again later.</p>";
@@ -69,6 +153,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Handle unregister functionality
   async function handleUnregister(event) {
+    if (!authState.user) {
+      messageDiv.textContent = "Please login first.";
+      messageDiv.className = "error";
+      messageDiv.classList.remove("hidden");
+      return;
+    }
+
     const button = event.target;
     const activity = button.getAttribute("data-activity");
     const email = button.getAttribute("data-email");
@@ -80,6 +171,9 @@ document.addEventListener("DOMContentLoaded", () => {
         )}/unregister?email=${encodeURIComponent(email)}`,
         {
           method: "DELETE",
+          headers: {
+            ...authHeaders(),
+          },
         }
       );
 
@@ -114,6 +208,13 @@ document.addEventListener("DOMContentLoaded", () => {
   signupForm.addEventListener("submit", async (event) => {
     event.preventDefault();
 
+    if (!authState.user) {
+      messageDiv.textContent = "Please login before signing up students.";
+      messageDiv.className = "error";
+      messageDiv.classList.remove("hidden");
+      return;
+    }
+
     const email = document.getElementById("email").value;
     const activity = document.getElementById("activity").value;
 
@@ -124,6 +225,9 @@ document.addEventListener("DOMContentLoaded", () => {
         )}/signup?email=${encodeURIComponent(email)}`,
         {
           method: "POST",
+          headers: {
+            ...authHeaders(),
+          },
         }
       );
 
@@ -132,7 +236,9 @@ document.addEventListener("DOMContentLoaded", () => {
       if (response.ok) {
         messageDiv.textContent = result.message;
         messageDiv.className = "success";
-        signupForm.reset();
+        if (authState.user.role !== "student") {
+          signupForm.reset();
+        }
 
         // Refresh activities list to show updated participants
         fetchActivities();
@@ -155,6 +261,73 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const username = document.getElementById("username").value;
+    const password = document.getElementById("password").value;
+
+    try {
+      const response = await fetch("/auth/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username, password }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        messageDiv.textContent = result.detail || "Login failed.";
+        messageDiv.className = "error";
+      } else {
+        authState.token = result.access_token;
+        authState.user = result.user;
+        localStorage.setItem("auth_token", authState.token);
+        updateAuthUI();
+        fetchActivities();
+        loginForm.reset();
+        messageDiv.textContent = `Logged in as ${result.user.username} (${result.user.role}).`;
+        messageDiv.className = "success";
+      }
+
+      messageDiv.classList.remove("hidden");
+      setTimeout(() => {
+        messageDiv.classList.add("hidden");
+      }, 5000);
+    } catch (error) {
+      messageDiv.textContent = "Login failed. Please try again.";
+      messageDiv.className = "error";
+      messageDiv.classList.remove("hidden");
+    }
+  });
+
+  logoutButton.addEventListener("click", async () => {
+    try {
+      if (authState.token) {
+        await fetch("/auth/logout", {
+          method: "POST",
+          headers: {
+            ...authHeaders(),
+          },
+        });
+      }
+    } finally {
+      authState.token = null;
+      authState.user = null;
+      localStorage.removeItem("auth_token");
+      updateAuthUI();
+      fetchActivities();
+      messageDiv.textContent = "Logged out.";
+      messageDiv.className = "info";
+      messageDiv.classList.remove("hidden");
+      setTimeout(() => {
+        messageDiv.classList.add("hidden");
+      }, 3000);
+    }
+  });
+
   // Initialize app
-  fetchActivities();
+  loadCurrentUser().then(fetchActivities);
 });

@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
+from typing import Optional
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +22,13 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+users_path = current_dir / "users.json"
+with users_path.open("r", encoding="utf-8") as users_file:
+    users_data = json.load(users_file)
+
+users = {user["username"]: user for user in users_data["users"]}
+active_tokens: dict[str, str] = {}
 
 # In-memory activity database
 activities = {
@@ -78,6 +89,40 @@ activities = {
 }
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _extract_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    return authorization.replace("Bearer ", "", 1).strip()
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)):
+    token = _extract_token(authorization)
+    username = active_tokens.get(token)
+
+    if not username or username not in users:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user = users[username]
+    return {
+        "username": user["username"],
+        "email": user["email"],
+        "role": user["role"]
+    }
+
+
+def require_roles(*roles: str):
+    def role_guard(current_user=Depends(get_current_user)):
+        if current_user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return current_user
+    return role_guard
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +133,44 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(credentials: LoginRequest):
+    user = users.get(credentials.username)
+    if not user or user["password"] != credentials.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(24)
+    active_tokens[token] = user["username"]
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "username": user["username"],
+            "email": user["email"],
+            "role": user["role"]
+        }
+    }
+
+
+@app.post("/auth/logout")
+def logout(authorization: Optional[str] = Header(default=None), current_user=Depends(get_current_user)):
+    token = _extract_token(authorization)
+    active_tokens.pop(token, None)
+    return {"message": f"Logged out {current_user['username']}"}
+
+
+@app.get("/auth/me")
+def me(current_user=Depends(get_current_user)):
+    return {"user": current_user}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, current_user=Depends(get_current_user)):
     """Sign up a student for an activity"""
+    if current_user["role"] == "student" and email != current_user["email"]:
+        raise HTTPException(status_code=403, detail="Students can only sign up themselves")
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -107,11 +187,21 @@ def signup_for_activity(activity_name: str, email: str):
 
     # Add student
     activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    return {
+        "message": f"Signed up {email} for {activity_name}",
+        "performed_by": {
+            "username": current_user["username"],
+            "role": current_user["role"]
+        }
+    }
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    current_user=Depends(require_roles("teacher", "admin", "leader"))
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -129,4 +219,10 @@ def unregister_from_activity(activity_name: str, email: str):
 
     # Remove student
     activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+    return {
+        "message": f"Unregistered {email} from {activity_name}",
+        "performed_by": {
+            "username": current_user["username"],
+            "role": current_user["role"]
+        }
+    }
